@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import signal
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator, Self
 
 import colorama as c
 from pylibsshext.channel import Channel as LibsshChannel
-from pylibsshext.errors import LibsshSessionException
+from pylibsshext.errors import LibsshChannelException, LibsshSessionException
 from pylibsshext.logging import ANSIBLE_PYLIBSSH_NOLOG
 from pylibsshext.session import Session as LibsshSession
 
@@ -260,6 +261,7 @@ class SSHProcess(Process[SSHProcessResult, SSHInputBuffer, SSHProcessTimeoutErro
             },
         )
 
+        self.__client: SSHClient = client
         self.__conn: LibsshSession = conn
         self.__unified_newlines: bool = unified_newlines
         self.__channel: LibsshChannel | None = None
@@ -300,7 +302,13 @@ class SSHProcess(Process[SSHProcessResult, SSHInputBuffer, SSHProcessTimeoutErro
         This is an internal method called by :meth:`run` after executing
         generic code.
         """
-        self.__channel = self.__conn.new_channel()
+        try:
+            self.__channel = self.__conn.new_channel()
+        except LibsshChannelException:
+            self.__client.reconnect()
+            self.__conn = self.__client.session
+            self.__channel = self.__conn.new_channel()
+
         try:
             self.__channel.request_exec(self.full_command_line)
             self.__stdout = SSHOutputBuffer(self.__channel, stderr=False)
@@ -519,6 +527,10 @@ class SSHClient(Connection[SSHProcess, SSHProcessResult]):
     def connected(self) -> bool:
         return bool(self.__conn.is_connected)
 
+    @property
+    def session(self) -> LibsshSession:
+        return self.__conn
+
     def connect(self) -> None:
         """
         Connect to the host.
@@ -549,6 +561,38 @@ class SSHClient(Connection[SSHProcess, SSHProcessResult]):
             self.__conn.set_log_level(ANSIBLE_PYLIBSSH_NOLOG)
         except LibsshSessionException as e:
             raise SSHAuthenticationError(self.host, self.port, self.user, e.message)
+
+    def reconnect(self, *, max_retries: int = 3, delay: float = 5) -> None:
+        """
+        Re-establish the SSH session.
+
+        This is used when the existing session is no longer able to open
+        channels, which can happen after long test runs or server-side idle
+        timeouts (common with Windows OpenSSH servers).
+        """
+        self.logger.info(
+            self.logger.colorize("Reconnecting SSH session to ", c.Style.BRIGHT)
+            + self.logger.colorize(self.host, c.Fore.BLUE, c.Style.BRIGHT)
+        )
+
+        last_error: SSHAuthenticationError | None = None
+        for attempt in range(max_retries):
+            try:
+                if self.connected:
+                    self.__conn.disconnect()
+
+                self.connect()
+                return
+            except SSHAuthenticationError as e:
+                last_error = e
+                if attempt >= max_retries - 1:
+                    break
+
+                self.logger.warning(f"SSH reconnect attempt {attempt + 1}/{max_retries} failed: {e}")
+                time.sleep(delay)
+
+        if last_error is not None:
+            raise last_error
 
     def disconnect(self) -> None:
         self.logger.info(
